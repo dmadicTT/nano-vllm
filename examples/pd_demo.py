@@ -41,10 +41,17 @@ def _wait_for_port(host: str, port: int, timeout: float = 30.0) -> None:
     raise TimeoutError(f"port {host}:{port} not open within {timeout}s")
 
 
-def _worker_entry(model: str, role: str, host: str, port: int, engine_kwargs: Dict) -> None:
+def _worker_entry(model: str, role: str, host: str, port: int, engine_kwargs: Dict,
+                  log_level: str = "WARNING") -> None:
     """Sub-process entrypoint. Builds the engine and starts a TCP listener."""
     # Re-add the repo root inside the spawned process.
     sys.path.insert(0, str(ROOT))
+    import logging
+    logging.basicConfig(
+        level=getattr(logging, log_level),
+        format=f"[{role}] %(asctime)s %(name)s %(levelname)s: %(message)s",
+        datefmt="%H:%M:%S",
+    )
     from nanovllm.engine.pd_server import serve
     serve(model=model, role=role, host=host, port=port, **engine_kwargs)
 
@@ -68,7 +75,26 @@ def main():
     p.add_argument("--max-tokens", type=int, default=64)
     p.add_argument("--temperature", type=float, default=0.7)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("-v", "--verbose-mooncake", action="store_true",
+                   help="Enable Mooncake logging at all layers: per-put/get lines from "
+                        "KVTransfer (Python INFO), Mooncake C++ glog verbose level, "
+                        "TransferEngine metrics, and stream master+metadata-server "
+                        "stderr to this process instead of /tmp logs.")
+    p.add_argument("--mooncake-glog-v", type=int, default=0,
+                   help="GLOG_v level for Mooncake C++ (0=quiet, 1=info, 2=debug). "
+                        "Implied >=1 when --verbose-mooncake is set.")
     args = p.parse_args()
+
+    # Apply Mooncake-side environment knobs BEFORE we spawn anything that
+    # links to the Mooncake shared object (master / metadata server / workers
+    # all inherit this env).
+    if args.verbose_mooncake:
+        os.environ["MC_TE_METRIC"] = "1"                    # transfer engine periodic metrics
+        os.environ["MC_STORE_CLIENT_METRIC_BANDWIDTH"] = "1"  # explicit bandwidth summary
+        os.environ.setdefault("GLOG_v", str(max(1, args.mooncake_glog_v)))
+    elif args.mooncake_glog_v:
+        os.environ["GLOG_v"] = str(args.mooncake_glog_v)
+    worker_log_level = "INFO" if args.verbose_mooncake else "WARNING"
 
     # The mooncake-transfer-engine pip wheel installs these into the venv's
     # bin/ on `pip install`, so they're on PATH inside an activated venv.
@@ -81,19 +107,32 @@ def main():
     procs = []
     try:
         # 1. metadata server (must be up before any client connects)
+        if args.verbose_mooncake:
+            meta_stdout, meta_stderr = None, None  # inherit -> printed on this terminal
+        else:
+            meta_stdout = open("/tmp/pd_demo_meta.log", "wb")
+            meta_stderr = subprocess.STDOUT
         meta = subprocess.Popen(
             [meta_bin, f"--port={args.meta_port}"],
-            stdout=open("/tmp/pd_demo_meta.log", "wb"), stderr=subprocess.STDOUT,
+            stdout=meta_stdout, stderr=meta_stderr,
         )
         procs.append(("meta", meta))
         _wait_for_port("127.0.0.1", args.meta_port)
         print(f"[demo] metadata server up on :{args.meta_port}")
 
         # 2. master
+        if args.verbose_mooncake:
+            master_stdout, master_stderr = None, None
+            master_cmd = [master_bin, f"--port={args.master_port}",
+                          f"--metrics_port={args.master_metrics_port}",
+                          "--alsologtostderr=true"]
+        else:
+            master_stdout = open("/tmp/pd_demo_master.log", "wb")
+            master_stderr = subprocess.STDOUT
+            master_cmd = [master_bin, f"--port={args.master_port}",
+                          f"--metrics_port={args.master_metrics_port}"]
         master = subprocess.Popen(
-            [master_bin, f"--port={args.master_port}",
-             f"--metrics_port={args.master_metrics_port}"],
-            stdout=open("/tmp/pd_demo_master.log", "wb"), stderr=subprocess.STDOUT,
+            master_cmd, stdout=master_stdout, stderr=master_stderr,
         )
         procs.append(("master", master))
         _wait_for_port("127.0.0.1", args.master_port)
@@ -119,12 +158,14 @@ def main():
         prefill_proc = ctx.Process(
             target=_worker_entry,
             args=(args.model, "prefill", "127.0.0.1", args.prefill_port,
-                  {**common_kwargs, "mooncake_local_hostname": f"127.0.0.1:{args.prefill_mc_port}"}),
+                  {**common_kwargs, "mooncake_local_hostname": f"127.0.0.1:{args.prefill_mc_port}"},
+                  worker_log_level),
         )
         decode_proc = ctx.Process(
             target=_worker_entry,
             args=(args.model, "decode", "127.0.0.1", args.decode_port,
-                  {**common_kwargs, "mooncake_local_hostname": f"127.0.0.1:{args.decode_mc_port}"}),
+                  {**common_kwargs, "mooncake_local_hostname": f"127.0.0.1:{args.decode_mc_port}"},
+                  worker_log_level),
         )
         prefill_proc.start()
         decode_proc.start()
@@ -216,23 +257,35 @@ def main():
                   f"   pulled: {st['blocks_pulled']} blocks / {mb_pulled:.1f} MiB"
                   f"   ({st['bytes_per_block'] / (1<<20):.1f} MiB/block)")
 
-        # Also try to dump the master's metric line for cross-check.
+        # Scrape the master's Prometheus /metrics endpoint. Works regardless
+        # of where master output is routed (verbose vs quiet mode).
         try:
-            with open("/tmp/pd_demo_master.log") as f:
-                lines = f.readlines()
-            metric_lines = [ln for ln in lines if "Master Admin Metrics" in ln]
-            if metric_lines:
-                import re
-                last = metric_lines[-1]
-                m = re.search(r"PutStart=(\d+)/(\d+).*?Get=(\d+)/(\d+)", last)
-                keys = re.search(r"Keys: (\d+)", last)
-                if m:
-                    s, t, gs, gt = m.groups()
-                    keys_n = keys.group(1) if keys else "?"
-                    print(f"  [master log] last metric line: "
-                          f"PutStart={s}/{t}, Get={gs}/{gt}, keys={keys_n}")
-        except FileNotFoundError:
-            pass
+            import urllib.request
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{args.master_metrics_port}/metrics", timeout=2
+            ) as r:
+                body = r.read().decode("utf-8", errors="replace")
+            interesting = {
+                "master_put_start_requests_total":  "puts",
+                "master_get_replica_list_requests_total": "gets",
+                "master_remove_requests_total":     "removes",
+                "master_exist_key_requests_total":  "exists",
+                "master_key_count":                 "keys (now)",
+                "master_active_clients":            "clients",
+                "master_allocated_bytes":           "alloc bytes",
+            }
+            counters = {}
+            for line in body.splitlines():
+                if line.startswith("#") or not line.strip():
+                    continue
+                name, _, val = line.partition(" ")
+                if name in interesting:
+                    counters[interesting[name]] = val.strip()
+            if counters:
+                print(f"  [master /metrics] " + "  ".join(
+                    f"{label}={v}" for label, v in counters.items()))
+        except Exception as e:
+            print(f"  [master /metrics] scrape failed: {e}")
 
         prefill.shutdown()
         decode.shutdown()

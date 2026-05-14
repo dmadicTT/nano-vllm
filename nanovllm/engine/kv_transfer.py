@@ -17,11 +17,14 @@ from __future__ import annotations
 
 import ctypes
 import glob
+import logging
 import os
 import time
 from typing import List, Optional
 
 import torch
+
+log = logging.getLogger("nanovllm.kv_transfer")
 
 
 # Preload libcudart (needed because the upstream Mooncake wheel was built
@@ -127,6 +130,15 @@ class KVTransfer:
         self.blocks_pushed = 0
         self.blocks_pulled = 0
 
+        log.info(
+            "KVTransfer[%s] connected: master=%s metadata=%s protocol=%s "
+            "block=%.1fMiB (L=%d, B=%d, S=%d, H=%d, D=%d, dtype=%s)",
+            role, master_addr, metadata_server, protocol,
+            self.bytes_per_block / (1 << 20),
+            self.num_layers, self.num_blocks, self.block_size,
+            self.num_kv_heads, self.head_dim, self.dtype,
+        )
+
     # -------- producer side (prefill) --------
     def push(self, request_id: str, block_ids: List[int]) -> None:
         """Publish each block of a request as its own Mooncake key.
@@ -134,6 +146,7 @@ class KVTransfer:
         `block_ids` is the prefill node's local block ids; the receiver uses
         its own different block ids and just keys by sequence-relative index.
         """
+        t0 = time.perf_counter()
         for seq_idx, bid in enumerate(block_ids):
             # Gather the (possibly strided) block into staging — copy_() handles
             # the layout translation, then we ship the contiguous bytes.
@@ -141,15 +154,26 @@ class KVTransfer:
             key = self.KEY_FMT.format(rid=request_id, idx=seq_idx)
             # `put` copies bytes into Mooncake's mounted segment, so we can
             # reuse the staging buffer immediately for the next block.
-            # Use view(torch.uint8) so bfloat16/float16 work without numpy.
             # Pull raw bytes out of the storage. This works for bfloat16 / fp16
             # which numpy doesn't natively support.
             payload = ctypes.string_at(self.staging.data_ptr(), self.bytes_per_block)
+            t_put = time.perf_counter()
             rc = self.store.put(key, payload)
             if rc != 0:
                 raise RuntimeError(f"Mooncake put({key}) failed rc={rc}")
             self.bytes_pushed += self.bytes_per_block
             self.blocks_pushed += 1
+            log.info(
+                "push  %s  local_bid=%d  %.1f MiB  put=%.3fs",
+                key, bid, self.bytes_per_block / (1 << 20),
+                time.perf_counter() - t_put,
+            )
+        log.info(
+            "push  %s: %d block(s) / %.1f MiB total in %.3fs",
+            request_id, len(block_ids),
+            len(block_ids) * self.bytes_per_block / (1 << 20),
+            time.perf_counter() - t0,
+        )
 
     # -------- consumer side (decode) --------
     def pull(self, request_id: str, block_ids: List[int],
@@ -158,14 +182,18 @@ class KVTransfer:
 
         Blocks until all expected keys are available (or `wait_timeout` is hit).
         """
+        t0 = time.perf_counter()
         deadline = time.monotonic() + wait_timeout
         for seq_idx, bid in enumerate(block_ids):
             key = self.KEY_FMT.format(rid=request_id, idx=seq_idx)
             # Spin until the producer has published this block.
+            t_wait = time.perf_counter()
             while self.store.is_exist(key) != 1:
                 if time.monotonic() > deadline:
                     raise TimeoutError(f"KV block {key} not received within {wait_timeout}s")
                 time.sleep(poll_interval)
+            wait_s = time.perf_counter() - t_wait
+            t_get = time.perf_counter()
             data = self.store.get(key)
             if not data:
                 raise RuntimeError(f"Mooncake get({key}) returned empty payload")
@@ -174,12 +202,23 @@ class KVTransfer:
                 raise RuntimeError(
                     f"Mooncake get({key}) returned {len(data)} bytes, expected {expected}"
                 )
+            get_s = time.perf_counter() - t_get
             # Materialize bytes into the staging tensor, then scatter into the
             # right block slot of the local kv_cache.
             tensor = torch.frombuffer(bytearray(data), dtype=self.dtype).view(*self.block_shape)
             self.kv_cache[:, :, bid, :, :, :].copy_(tensor)
             self.bytes_pulled += self.bytes_per_block
             self.blocks_pulled += 1
+            log.info(
+                "pull  %s  local_bid=%d  %.1f MiB  wait=%.3fs get=%.3fs",
+                key, bid, self.bytes_per_block / (1 << 20), wait_s, get_s,
+            )
+        log.info(
+            "pull  %s: %d block(s) / %.1f MiB total in %.3fs",
+            request_id, len(block_ids),
+            len(block_ids) * self.bytes_per_block / (1 << 20),
+            time.perf_counter() - t0,
+        )
 
     def remove(self, request_id: str, num_blocks: int) -> None:
         """Best-effort cleanup of a request's published blocks.
