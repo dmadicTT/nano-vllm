@@ -135,6 +135,9 @@ class KVTransfer:
         # Blocks that we *would* have pushed but skipped because the key was
         # already in the store (cross-request prefix cache hit).
         self.blocks_skipped_push = 0
+        # Subset of `blocks_pulled`: those pulled by prefill-side prefetch
+        # rather than decode-side handoff. Bumped by the engine.
+        self.blocks_prefetched = 0
 
         log.info(
             "KVTransfer[%s] connected: master=%s metadata=%s protocol=%s "

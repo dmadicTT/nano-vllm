@@ -63,11 +63,18 @@ def main():
     p.add_argument("--master-metrics-port", type=int, default=9013,
                    help="Mooncake master admin/metrics port (9003 default often collides)")
     p.add_argument("--meta-port", type=int, default=8081)
-    p.add_argument("--prefill-port", type=int, default=18001)
-    p.add_argument("--decode-port", type=int, default=18002)
+    p.add_argument("--num-prefill", type=int, default=1,
+                   help="Number of prefill workers to spawn. Each shares the same "
+                        "Mooncake master, so they cooperate via the cross-request "
+                        "prefix cache.")
+    p.add_argument("--prefill-port", type=int, default=18001,
+                   help="HTTP port for prefill workers (each gets N+i for i=0..num-prefill-1).")
+    p.add_argument("--decode-port", type=int, default=18002,
+                   help="HTTP port for the decode worker (offset past the prefill range).")
     p.add_argument("--prefill-mc-port", type=int, default=14001,
-                   help="prefill node's TransferEngine port (Mooncake)")
-    p.add_argument("--decode-mc-port", type=int, default=14002)
+                   help="Base Mooncake TransferEngine port; prefill workers use N+i.")
+    p.add_argument("--decode-mc-port", type=int, default=14002,
+                   help="Mooncake TransferEngine port for the decode worker.")
     p.add_argument("--protocol", default="tcp", choices=["tcp", "rdma"],
                    help="Mooncake transfer protocol")
     p.add_argument("--rdma-devices", default="",
@@ -159,30 +166,52 @@ def main():
             mooncake_rdma_devices=args.rdma_devices,
         )
         ctx = mp.get_context("spawn")
-        prefill_proc = ctx.Process(
-            target=_worker_entry,
-            args=(args.model, "prefill", "127.0.0.1", args.prefill_port,
-                  {**common_kwargs, "mooncake_local_hostname": f"127.0.0.1:{args.prefill_mc_port}"},
-                  worker_log_level),
-        )
+        # Lay out ports so that with --num-prefill N the prefill workers occupy
+        # the contiguous range [prefill_port, prefill_port+N) and decode sits
+        # past them (avoids collisions when N > 1 with the default ports).
+        prefill_ports = [args.prefill_port + i for i in range(args.num_prefill)]
+        prefill_mc_ports = [args.prefill_mc_port + i for i in range(args.num_prefill)]
+        decode_port = max(args.decode_port, max(prefill_ports) + 1)
+        decode_mc_port = max(args.decode_mc_port, max(prefill_mc_ports) + 1)
+
+        prefill_procs = []
+        for i, (port, mc_port) in enumerate(zip(prefill_ports, prefill_mc_ports)):
+            proc = ctx.Process(
+                target=_worker_entry,
+                args=(args.model, "prefill", "127.0.0.1", port,
+                      {**common_kwargs, "mooncake_local_hostname": f"127.0.0.1:{mc_port}"},
+                      worker_log_level),
+            )
+            proc.start()
+            prefill_procs.append(proc)
+            procs.append((f"prefill{i}", proc))
         decode_proc = ctx.Process(
             target=_worker_entry,
-            args=(args.model, "decode", "127.0.0.1", args.decode_port,
-                  {**common_kwargs, "mooncake_local_hostname": f"127.0.0.1:{args.decode_mc_port}"},
+            args=(args.model, "decode", "127.0.0.1", decode_port,
+                  {**common_kwargs, "mooncake_local_hostname": f"127.0.0.1:{decode_mc_port}"},
                   worker_log_level),
         )
-        prefill_proc.start()
         decode_proc.start()
-        procs.append(("prefill", prefill_proc))
         procs.append(("decode", decode_proc))
         # Workers each take ~30s to load the model on CPU.
-        _wait_for_port("127.0.0.1", args.prefill_port, timeout=120)
-        _wait_for_port("127.0.0.1", args.decode_port, timeout=120)
-        print("[demo] workers up. Building client...")
+        for port in prefill_ports:
+            _wait_for_port("127.0.0.1", port, timeout=120)
+        _wait_for_port("127.0.0.1", decode_port, timeout=120)
+        print(f"[demo] {len(prefill_ports)} prefill worker(s) on {prefill_ports} "
+              f"and decode worker on :{decode_port} are up. Building clients...")
 
         from nanovllm.engine.pd_server import PDClient
-        prefill = PDClient("127.0.0.1", args.prefill_port)
-        decode = PDClient("127.0.0.1", args.decode_port)
+        prefill_clients = [PDClient("127.0.0.1", port) for port in prefill_ports]
+        decode = PDClient("127.0.0.1", decode_port)
+        # Round-robin load balancer across prefill workers. With
+        # content-addressed Mooncake keys, any prefill node will hit the
+        # shared prefix cache regardless of which one runs a given request,
+        # so even a dumb LB exploits the cache.
+        _rr = [0]
+        def pick_prefill():
+            c = prefill_clients[_rr[0] % len(prefill_clients)]
+            _rr[0] += 1
+            return c
 
         # 4. Drive multi-turn conversations. Two separate conversations alternating.
         import torch
@@ -222,6 +251,8 @@ def main():
             prompt = chat_template(transcripts[conv_idx])
             prompt_ids = tok.encode(prompt)
             rid = f"conv{conv_idx}_turn{len(transcripts[conv_idx])}"
+            prefill = pick_prefill()
+            pf_label = f"prefill@{prefill.base.rsplit(':', 1)[-1]}"
             print(f"\n=== [{rid}] user: {user_msg!r} ({len(prompt_ids)} tokens) ===")
             t0 = time.perf_counter()
             r = prefill.prefill(prompt_ids, rid, args.temperature, args.max_tokens)
@@ -229,7 +260,7 @@ def main():
             if not r.get("ok"):
                 print("PREFILL FAILED:", r); break
             desc = r["descriptor"]
-            print(f"    prefill: {t_prefill:.2f}s  blocks={len(desc['block_hashes'])}  "
+            print(f"    {pf_label}: {t_prefill:.2f}s  blocks={len(desc['block_hashes'])}  "
                   f"first_tok={desc['first_token']}")
             t0 = time.perf_counter()
             r = decode.decode(desc)
@@ -247,21 +278,30 @@ def main():
             for m in t:
                 print(f"  [{m['role']:9}] {m['content']!r}")
 
-        # Pull authoritative counters straight from each worker's KVTransfer.
-        p_stats = prefill.stats().get("stats", {})
-        d_stats = decode.stats().get("stats", {})
+        # Pull authoritative counters from every worker's KVTransfer.
         print("\n" + "-" * 70)
         print("Mooncake KV transfer summary (in-process counters):")
-        for name, st in [("prefill", p_stats), ("decode", d_stats)]:
+        worker_stats = []
+        for idx, client in enumerate(prefill_clients):
+            tag = f"prefill[{idx}]" if len(prefill_clients) > 1 else "prefill"
+            worker_stats.append((tag, client.stats().get("stats", {})))
+        worker_stats.append(("decode", decode.stats().get("stats", {})))
+        for name, st in worker_stats:
             if not st:
                 continue
             mb_pushed = st["bytes_pushed"] / (1 << 20)
             mb_pulled = st["bytes_pulled"] / (1 << 20)
             skipped = st.get("blocks_skipped_push", 0)
-            skip_note = f"  skipped (cache hit): {skipped}" if skipped else ""
-            print(f"  [{name}]  pushed: {st['blocks_pushed']} blocks / {mb_pushed:.1f} MiB"
+            prefetched = st.get("blocks_prefetched", 0)
+            extras = []
+            if skipped:
+                extras.append(f"skipped-put: {skipped}")
+            if prefetched:
+                extras.append(f"prefetched: {prefetched}")
+            extras_str = "  " + "  ".join(extras) if extras else ""
+            print(f"  [{name:10}]  pushed: {st['blocks_pushed']} blocks / {mb_pushed:.1f} MiB"
                   f"   pulled: {st['blocks_pulled']} blocks / {mb_pulled:.1f} MiB"
-                  f"   ({st['bytes_per_block'] / (1<<20):.1f} MiB/block){skip_note}")
+                  f"{extras_str}")
 
         # Scrape the master's Prometheus /metrics endpoint. Works regardless
         # of where master output is routed (verbose vs quiet mode).

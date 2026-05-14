@@ -1,9 +1,12 @@
 import atexit
+import logging
 from dataclasses import fields
 from time import perf_counter
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer
 import torch.multiprocessing as mp
+
+log = logging.getLogger("nanovllm.engine")
 
 from nanovllm.config import Config
 from nanovllm.sampling_params import SamplingParams
@@ -130,7 +133,24 @@ class LLMEngine:
         receiver doesn't depend on that).
         """
         assert self.config.role == "prefill", "called run_prefill_and_publish in non-prefill role"
-        seq = Sequence(list(prompt), sampling_params)
+        # Build a relaxed SamplingParams for the prefill-side seq: the
+        # scheduler's postprocess finishes a seq when num_completion_tokens
+        # equals max_tokens (or it hits EOS), and on FINISH it deallocates —
+        # which would wipe out the block_table and num_cached_tokens before
+        # we get a chance to capture them for the handoff. The actual
+        # max_tokens / ignore_eos belong to the decode side and are recorded
+        # in the descriptor below.
+        prefill_sp = SamplingParams(
+            temperature=sampling_params.temperature,
+            max_tokens=max(sampling_params.max_tokens, 2),
+            ignore_eos=True,
+        )
+        seq = Sequence(list(prompt), prefill_sp)
+        # Try to satisfy the prompt's prefix from Mooncake's shared cache
+        # before we burn local compute on it. This is the "remote tier" of
+        # nano-vllm's prefix cache and turns Mooncake into a fleet-wide
+        # KV cache that any prefill node can warm.
+        self._prefetch_from_store(seq)
         self.scheduler.add(seq)
         # Iterate until the seq leaves prefill (status RUNNING and the next token is appended).
         while not seq.is_finished and seq.status != SequenceStatus.RUNNING:
@@ -165,6 +185,73 @@ class LLMEngine:
         self.kv_transport.push(block_hashes, block_ids)
         self._evict_seq(seq)
         return descriptor
+
+    def _prefetch_from_store(self, seq: Sequence) -> int:
+        """Pull any prompt-prefix blocks that are already in Mooncake into the
+        local KV cache, so the model only forward-passes over the suffix.
+
+        Algorithm:
+          * Walk the prompt full block-by-full block, computing the same xxh64
+            chain hash `BlockManager.compute_hash` uses.
+          * Local hit (`hash_to_block_id`)  → already covered by the existing
+            nano-vllm prefix cache; nothing to do.
+          * Mooncake hit                   → peek at `free_block_ids[0]`, pull
+            the bytes into that slot, write the block's hash + tokens, and
+            advertise it in `hash_to_block_id`. We don't pop the block from
+            the free list — the scheduler's subsequent `allocate()` does that
+            via its normal "cached block found by hash" path, which gets the
+            ref counts right.
+          * Miss                          → stop (we only honor a contiguous
+            prefix; the suffix will be computed locally).
+
+        Returns the number of blocks newly pulled from Mooncake (local hits
+        don't count — those were already covered before this call).
+        """
+        if self.kv_transport is None:
+            return 0
+        bs = self.config.kvcache_block_size
+        bm = self.scheduler.block_manager
+        # Only full blocks are eligible. BlockManager.can_allocate also skips
+        # the last (partial) block, so anything we advertise beyond what
+        # can_allocate walks would be ignored.
+        n_full = seq.num_prompt_tokens // bs
+        if n_full == 0:
+            return 0
+        h = -1
+        local_hits = 0
+        remote_hits = 0
+        for i in range(n_full):
+            tokens = seq.token_ids[i * bs:(i + 1) * bs]
+            h = BlockManager.compute_hash(tokens, h)
+            # Local hit?
+            local_bid = bm.hash_to_block_id.get(h, -1)
+            if local_bid != -1 and bm.blocks[local_bid].token_ids == tokens:
+                local_hits += 1
+                continue
+            # Mooncake hit?
+            key = self.kv_transport.KEY_FMT.format(h=h & ((1 << 64) - 1))
+            if self.kv_transport.store.is_exist(key) != 1:
+                break  # contiguous prefix only — first miss ends the walk
+            if not bm.free_block_ids:
+                break  # capacity-bound — defer the rest to local compute
+            bid = bm.free_block_ids[0]  # peek; scheduler.allocate will pop
+            # The slot we're about to repurpose may have advertised a stale
+            # hash from a previous tenant; drop that advert before we replace.
+            old_hash = bm.blocks[bid].hash
+            if old_hash != -1 and bm.hash_to_block_id.get(old_hash) == bid:
+                del bm.hash_to_block_id[old_hash]
+            # Pull the KV bytes into kv_cache[bid] and advertise.
+            self.kv_transport.pull([h], [bid])
+            self.kv_transport.blocks_prefetched += 1
+            bm.blocks[bid].update(h, tokens)
+            bm.hash_to_block_id[h] = bid
+            remote_hits += 1
+        if local_hits or remote_hits:
+            log.info(
+                "prefill prefetch: %d local-hit + %d Mooncake pull (out of %d full prompt blocks)",
+                local_hits, remote_hits, n_full,
+            )
+        return remote_hits
 
     def _compute_block_hashes(self, seq: Sequence) -> list[int]:
         """xxh64 chain hash over the prompt tokens, block by block.

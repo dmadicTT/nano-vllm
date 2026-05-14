@@ -139,6 +139,45 @@ local blocks (bypassing the prefix-hash logic, see gotcha 4), and
 `pull(block_hashes, decode_local_block_ids)`s the prompt's KV bytes into
 them, then runs its scheduler from the decode branch.
 
+### Prefill-side prefetch (Mooncake as a remote prefix-cache tier)
+
+Before `run_prefill_and_publish` even adds the seq to the scheduler, it
+walks the prompt block-by-block and:
+
+* on a local cache hit (`hash_to_block_id`), leaves the block alone — the
+  existing nano-vllm prefix cache already covers it;
+* on a Mooncake hit (`store.is_exist(key) == 1`), peeks at a free block,
+  pulls the bytes into it, registers the block's hash + tokens, and leaves
+  it in the free list. The scheduler's subsequent `allocate()` finds it via
+  the cached-block path and ref-counts it normally;
+* on a miss, stops — only a contiguous prefix is honored.
+
+`scheduler.schedule()` then sees a seq whose `num_cached_tokens` already
+covers the prefetched prefix, and the model forward only runs on the
+suffix. This works the same way whether the prefix was filled by a previous
+turn on this node, an earlier turn on a sibling prefill node, or a decode
+node's pull from a third node — because the key namespace is content-only.
+
+Counters exposed on `/stats`:
+* `blocks_pushed`         — `put`s that actually hit the wire
+* `blocks_skipped_push`   — `put`s that short-circuited via `is_exist`
+* `blocks_pulled`         — every `get` (prefetch + decode)
+* `blocks_prefetched`     — subset of `blocks_pulled` issued by prefetch
+
+### Multiple prefill workers
+
+The architecture supports a fleet of prefill nodes with no engine-level
+changes — each one runs its own `LLMEngine(role='prefill')` and talks to the
+same Mooncake master. Content-addressed keys mean two nodes computing
+the same prompt produce the same key, and the prefetch path means the
+second-mover doesn't recompute.
+
+`pd_demo.py` takes `--num-prefill N` to spawn N workers on ports
+`[prefill_port, prefill_port+N)` and round-robins requests across them.
+`pd_prefetch_demo.py` is a tighter focused demo: it sends the same prompt
+to two nodes in series and prints the stats so you can see node 1 hit
+Mooncake instead of recomputing.
+
 The first generated token's KV gets written on the decode side during its
 first decode step. So exactly the prompt is what crosses the wire.
 
