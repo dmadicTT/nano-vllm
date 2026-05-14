@@ -7,11 +7,6 @@ prefill and decode** workers that exchange KV cache via the full
 It also captures the things that surprised me on the way there. If you only
 want to *run* the demo, jump to [Quick run](#quick-run).
 
-> Heads-up: an earlier `pd_disagg/` experiment sits next to this doc. It
-> bypassed nanovllm's engine and only used Mooncake's TransferEngine. This
-> integration is a from-scratch rewrite that modifies nanovllm in-place and
-> uses Mooncake Store (master + clients + transfer engines).
-
 ---
 
 ## 1. What changes — and where
@@ -241,10 +236,9 @@ this by issuing two `put`s back-to-back with the same `bytearray` (mutated
 between calls) and reading both keys back — each returned its own snapshot.
 
 `put_from(key, ptr, size)` is the zero-copy variant. The source buffer must
-stay alive at least until every consumer has finished `get_into`. The early
-`pd_disagg/` experiment in this repo hit a subtle race because it freed the
-source buffer before the receiver had pulled it. We sidestep that by using
-the copying `put` API.
+stay alive at least until every consumer has finished `get_into` — re-using
+or freeing it before that races. We sidestep that by using the copying `put`
+API; the staging tensor can be reused for the next block immediately.
 
 ### 4. The block-manager hash logic gets in the way of migration
 
@@ -342,5 +336,4 @@ clash.
 ## 6. Useful pointers
 
 * Mooncake project — https://github.com/kvcache-ai/Mooncake
-* The earlier `pd_disagg/` experiment in this repo — kept for comparison.
 * The original nano-vllm — https://github.com/GeeeekExplorer/nano-vllm
