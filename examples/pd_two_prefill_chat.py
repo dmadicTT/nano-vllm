@@ -64,7 +64,7 @@ def _restore_stderr(saved_fd: int):
 
 def _worker_entry(role: str, port: int, mc_port: int,
                   mooncake_master_port: int, meta_port: int, model: str,
-                  tag: str) -> None:
+                  tag: str, block_size: int) -> None:
     sys.path.insert(0, str(ROOT))
     import warnings
     warnings.filterwarnings("ignore")
@@ -82,7 +82,8 @@ def _worker_entry(role: str, port: int, mc_port: int,
             model=model, role=role,
             device="cpu", tensor_parallel_size=1, enforce_eager=True,
             max_num_seqs=2, max_num_batched_tokens=2048, max_model_len=2048,
-            num_kvcache_blocks=12,
+            kvcache_block_size=block_size,
+            num_kvcache_blocks=128,
             mooncake_master_addr=f"127.0.0.1:{mooncake_master_port}",
             mooncake_metadata_server=f"http://127.0.0.1:{meta_port}/metadata",
             mooncake_protocol="tcp",
@@ -143,7 +144,13 @@ def main():
     ap.add_argument("--master-port", type=int, default=50059)
     ap.add_argument("--meta-port", type=int, default=8089)
     ap.add_argument("--max-tokens", type=int, default=40)
+    ap.add_argument("--block-size", type=int, default=32,
+                    help="KV cache page size in tokens. Smaller = finer-grained "
+                         "prefix sharing; larger = fewer Mooncake keys per request.")
     args = ap.parse_args()
+
+    master_log_path = "/tmp/pd_two_prefill_master.log"
+    meta_log_path = "/tmp/pd_two_prefill_meta.log"
 
     # Quiet Mooncake's C++ glog at the OS-env level so it propagates to the
     # spawned workers, master, and metadata server (all read this on init).
@@ -156,6 +163,7 @@ def main():
                             module="multiprocessing.resource_tracker")
     _quiet_logging("demo")
     demo_log = logging.getLogger("demo")
+    demo_log.info("KV cache block size: %d tokens", args.block_size)
 
     master_bin = shutil.which("mooncake_master")
     meta_bin = shutil.which("mooncake_http_metadata_server")
@@ -163,12 +171,24 @@ def main():
         sys.exit("mooncake_master / mooncake_http_metadata_server not on PATH "
                  "(did you `pip install .`?)")
 
+    # Route master + metadata server stdout/stderr to dedicated log files so
+    # we can show the user where to find them at the end of the run.
+    meta_log = open(meta_log_path, "wb")
+    master_log = open(master_log_path, "wb")
     meta = subprocess.Popen([meta_bin, f"--port={args.meta_port}"],
-                            stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT,
+                            stdout=meta_log, stderr=subprocess.STDOUT,
                             start_new_session=True)
+    # Master gets its own env so its glog INFO lines actually land in the
+    # log file. The parent's GLOG_minloglevel=2 is set to silence the
+    # workers' boot-time noise on the demo's terminal, but we *do* want
+    # the master's audit log captured to disk.
+    master_env = dict(os.environ)
+    master_env["GLOG_minloglevel"] = "0"
     master = subprocess.Popen([master_bin, f"--port={args.master_port}",
-                               f"--metrics_port={args.master_port + 1000}"],
-                              stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT,
+                               f"--metrics_port={args.master_port + 1000}",
+                               "--alsologtostderr=true"],
+                              stdout=master_log, stderr=subprocess.STDOUT,
+                              env=master_env,
                               start_new_session=True)
     time.sleep(2)
 
@@ -179,17 +199,17 @@ def main():
         proc_a = ctx.Process(
             target=_worker_entry,
             args=("prefill", 19101, 14921, args.master_port, args.meta_port,
-                  args.model, "prefill@A"),
+                  args.model, "prefill@A", args.block_size),
         )
         proc_b = ctx.Process(
             target=_worker_entry,
             args=("prefill", 19102, 14922, args.master_port, args.meta_port,
-                  args.model, "prefill@B"),
+                  args.model, "prefill@B", args.block_size),
         )
         proc_d = ctx.Process(
             target=_worker_entry,
             args=("decode", 19103, 14923, args.master_port, args.meta_port,
-                  args.model, "decode"),
+                  args.model, "decode", args.block_size),
         )
         for p in (proc_a, proc_b, proc_d):
             p.start()
@@ -249,6 +269,29 @@ def main():
             except Exception:
                 try: os.killpg(proc.pid, signal.SIGKILL)
                 except Exception: pass
+        try:
+            master_log.close()
+        except Exception:
+            pass
+        try:
+            meta_log.close()
+        except Exception:
+            pass
+
+        # Show where the master logs landed and tail them so the user has
+        # a quick sanity-check of what Mooncake recorded.
+        print()
+        print(f"Mooncake master log: {master_log_path}")
+        print(f"Mooncake metadata-server log: {meta_log_path}")
+        try:
+            with open(master_log_path) as f:
+                tail = f.readlines()[-10:]
+            print("--- last 10 lines of master log ---")
+            for line in tail:
+                print(line.rstrip())
+            print("--- end ---")
+        except FileNotFoundError:
+            print("(master log file not present)")
 
 
 if __name__ == "__main__":

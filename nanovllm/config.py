@@ -32,7 +32,12 @@ class Config:
 
     def __post_init__(self):
         assert os.path.isdir(self.model)
-        assert self.kvcache_block_size % 256 == 0
+        # Original upstream constraint was `% 256 == 0` to match a CUDA
+        # kernel tile alignment. The CPU attention path doesn't care about
+        # the tile shape and uses block_size only as a paging granularity,
+        # so any positive value works there. The CUDA path can still pass
+        # a multiple of 256 explicitly.
+        assert self.kvcache_block_size > 0
         assert 1 <= self.tensor_parallel_size <= 8
         assert self.device in ("cuda", "cpu")
         assert self.role in ("prefill", "decode", "colocated")
