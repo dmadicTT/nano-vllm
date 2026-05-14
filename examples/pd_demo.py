@@ -294,10 +294,24 @@ def main():
             try:
                 if hasattr(p, "terminate"):
                     p.terminate()
+                # First wait the SIGTERM out; if the process ignores it
+                # (mooncake_master is known to be sluggish on SIGTERM),
+                # follow up with SIGKILL so we don't leak orphans onto
+                # ports 50051 / 8081 across runs.
                 if hasattr(p, "join"):
-                    p.join(timeout=10)
+                    p.join(timeout=5)
+                    if p.is_alive():
+                        p.kill()
+                        p.join(timeout=3)
                 elif hasattr(p, "wait"):
-                    p.wait(timeout=5)
+                    try:
+                        p.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        p.kill()
+                        try:
+                            p.wait(timeout=3)
+                        except subprocess.TimeoutExpired:
+                            pass
             except Exception:
                 pass
         print("[demo] shut down all subprocesses")
