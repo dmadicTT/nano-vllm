@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import multiprocessing as mp
 import os
+import shutil
 import signal
 import socket
 import subprocess
@@ -69,11 +70,13 @@ def main():
     p.add_argument("--seed", type=int, default=0)
     args = p.parse_args()
 
-    master_bin = os.path.expanduser("~/.local/bin/mooncake_master")
-    meta_bin = os.path.expanduser("~/.local/bin/mooncake_http_metadata_server")
-    if not (os.path.exists(master_bin) and os.path.exists(meta_bin)):
-        sys.exit("mooncake_master / mooncake_http_metadata_server not found in ~/.local/bin "
-                 "(pip install mooncake-transfer-engine)")
+    # The mooncake-transfer-engine pip wheel installs these into the venv's
+    # bin/ on `pip install`, so they're on PATH inside an activated venv.
+    master_bin = shutil.which("mooncake_master")
+    meta_bin = shutil.which("mooncake_http_metadata_server")
+    if not (master_bin and meta_bin):
+        sys.exit("mooncake_master / mooncake_http_metadata_server not on PATH "
+                 "(did you `pip install .` or `pip install mooncake-transfer-engine`?)")
 
     procs = []
     try:

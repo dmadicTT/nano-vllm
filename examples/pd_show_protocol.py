@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import multiprocessing as mp
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -75,8 +76,11 @@ def _worker_entry(model, role, host, port, engine_kwargs):
 
 def main():
     model = str(ROOT / "models/Qwen3-0.6B")
-    master_bin = os.path.expanduser("~/.local/bin/mooncake_master")
-    meta_bin = os.path.expanduser("~/.local/bin/mooncake_http_metadata_server")
+    master_bin = shutil.which("mooncake_master")
+    meta_bin = shutil.which("mooncake_http_metadata_server")
+    if not (master_bin and meta_bin):
+        sys.exit("mooncake_master / mooncake_http_metadata_server not on PATH "
+                 "(did you `pip install .`?)")
 
     procs = []
     try:

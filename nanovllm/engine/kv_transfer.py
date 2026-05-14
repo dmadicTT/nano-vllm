@@ -27,14 +27,35 @@ import torch
 # Preload libcudart (needed because the upstream Mooncake wheel was built
 # against CUDA). On CPU-only hosts this is harmless — we never call cudaMalloc.
 def _preload_cuda():
-    for p in glob.glob('/opt/venv/lib/python3.10/site-packages/nvidia/cuda_runtime/lib/libcudart.so*'):
+    # First try the canonical names — works if libcudart is already on
+    # LD_LIBRARY_PATH or installed system-wide.
+    for name in ("libcudart.so.12", "libcudart.so"):
         try:
-            ctypes.CDLL(p, mode=ctypes.RTLD_GLOBAL)
+            ctypes.CDLL(name, mode=ctypes.RTLD_GLOBAL)
             return
         except OSError:
             pass
-    # Fall through: if Mooncake can resolve cudart itself, the import will
-    # still succeed.
+    # Otherwise look inside the nvidia-cuda-runtime-cu12 pip wheel for the
+    # current Python environment. `nvidia.cuda_runtime` is a PEP 420 namespace
+    # package (no __init__.py / no __file__), so we resolve through __path__.
+    try:
+        import nvidia.cuda_runtime  # type: ignore
+        for base in list(nvidia.cuda_runtime.__path__):
+            lib_dir = os.path.join(base, "lib")
+            if not os.path.isdir(lib_dir):
+                continue
+            for entry in sorted(os.listdir(lib_dir)):
+                if entry.startswith("libcudart.so"):
+                    try:
+                        ctypes.CDLL(os.path.join(lib_dir, entry), mode=ctypes.RTLD_GLOBAL)
+                        return
+                    except OSError:
+                        pass
+    except (ImportError, OSError, FileNotFoundError):
+        pass
+    # Fall through: if Mooncake's shared object can resolve cudart itself,
+    # the import will still succeed; otherwise the next line will raise the
+    # real ImportError so the user knows what's missing.
 
 
 _preload_cuda()

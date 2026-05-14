@@ -43,7 +43,7 @@ integration is in-tree — see `nanovllm/engine/kv_transfer.py`,
 End-to-end multi-turn chat demo (CPU-only):
 
 ```bash
-pip install mooncake-transfer-engine nvidia-cuda-runtime-cu12
+pip install .                              # pulls torch, transformers, mooncake, ...
 huggingface-cli download Qwen/Qwen3-0.6B \
     --local-dir models/Qwen3-0.6B --local-dir-use-symlinks False
 python examples/pd_demo.py

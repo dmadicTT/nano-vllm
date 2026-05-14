@@ -17,7 +17,7 @@ transport adapter.
 | File | Change |
 |---|---|
 | `nanovllm/config.py` | adds `device` (`'cuda'`/`'cpu'`), `role` (`'prefill'`/`'decode'`/`'colocated'`) and a small set of `mooncake_*` fields |
-| `nanovllm/layers/attention.py` | adds a CPU attention path (`F.scaled_dot_product_attention`-based) plus a CPU KV-cache store. flash-attn + triton are now imported lazily so a CPU build doesn't need them. |
+| `nanovllm/layers/attention.py` | adds a CPU attention path (`F.scaled_dot_product_attention`-based) plus a CPU KV-cache store. flash-attn + triton are now lazy-imported behind the GPU path and dropped from `pyproject.toml`; you only need them if you build with a CUDA toolkit and run `device='cuda'`. |
 | `nanovllm/engine/model_runner.py` | CPU branch that uses the `gloo` dist backend, allocates the paged KV cache on CPU and skips CUDA graphs / NCCL / `.cuda()` transfers |
 | `nanovllm/engine/llm_engine.py` | wires `KVTransfer` in when `role != 'colocated'`, adds `run_prefill_and_publish` and `run_decode_from_handoff` |
 | `nanovllm/engine/kv_transfer.py` (new) | wraps a Mooncake Store client tied to a specific paged KV cache tensor |
@@ -137,13 +137,9 @@ first decode step. So exactly the prompt is what crosses the wire.
 ### Prerequisites
 
 ```bash
-# Mooncake (transfer engine + master binary). Despite the name, this wheel
-# also includes the master / store binaries and Python bindings.
-pip install mooncake-transfer-engine
-
-# The pre-built Mooncake wheel was compiled against CUDA, so on a CPU-only
-# host we need libcudart for the dynamic loader (no GPU is required at runtime).
-pip install nvidia-cuda-runtime-cu12
+# nanovllm + Mooncake + libcudart (everything needed for the disaggregated
+# CPU path is declared in pyproject.toml).
+pip install .
 
 # A model file (Qwen3-0.6B in the example)
 huggingface-cli download Qwen/Qwen3-0.6B \

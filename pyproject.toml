@@ -13,10 +13,15 @@ description = "a lightweight vLLM implementation built from scratch"
 requires-python = ">=3.10,<3.13"
 dependencies = [
     "torch>=2.4.0",
-    "triton>=3.0.0",
     "transformers>=4.51.0",
-    "flash-attn",
+    "tqdm",
     "xxhash",
+    # Mooncake stack — master service binary + Python bindings ship in this wheel.
+    "mooncake-transfer-engine",
+    # The Mooncake wheel is built against CUDA 12 even on CPU hosts, so the
+    # dynamic loader needs libcudart.so.12 to resolve symbols. CUDA itself is
+    # not used at runtime on the CPU path.
+    "nvidia-cuda-runtime-cu12",
 ]
 
 [project.urls]
