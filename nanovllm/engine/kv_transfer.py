@@ -79,13 +79,16 @@ class KVTransfer:
       * Decode calls `remove(request_id, num_blocks)` once it has the data
         and the keys can be reclaimed.
 
-    `block_ids` is the *local* block table — the index space differs between
-    prefill and decode because each side runs its own block manager. The
-    sequence-relative block index (0, 1, ...) is encoded in the Mooncake
-    key so the receiver knows which slot to fill.
+    Block IDs are *local* to each side — prefill and decode each run their
+    own block manager and their index spaces differ. We content-address every
+    block by an `xxh64` chain hash over the tokens it covers (matching
+    nano-vllm's local BlockManager.compute_hash). Two requests that share a
+    prefix produce the same hashes and therefore reuse the same Mooncake
+    keys — Mooncake naturally becomes a cross-request prefix cache. Keys are
+    not tied to a request id; we never call `remove`.
     """
 
-    KEY_FMT = "nanovllm/req/{rid}/blk/{idx}"
+    KEY_FMT = "nanovllm/kv/{h:016x}"
 
     def __init__(self, kv_cache: torch.Tensor, *, role: str,
                  local_hostname: str, metadata_server: str, master_addr: str,
@@ -129,6 +132,9 @@ class KVTransfer:
         self.bytes_pulled = 0
         self.blocks_pushed = 0
         self.blocks_pulled = 0
+        # Blocks that we *would* have pushed but skipped because the key was
+        # already in the store (cross-request prefix cache hit).
+        self.blocks_skipped_push = 0
 
         log.info(
             "KVTransfer[%s] connected: master=%s metadata=%s protocol=%s "
@@ -140,22 +146,37 @@ class KVTransfer:
         )
 
     # -------- producer side (prefill) --------
-    def push(self, request_id: str, block_ids: List[int]) -> None:
-        """Publish each block of a request as its own Mooncake key.
+    def push(self, block_hashes: List[int], local_block_ids: List[int]) -> None:
+        """Publish each block's KV bytes under its content hash.
 
-        `block_ids` is the prefill node's local block ids; the receiver uses
-        its own different block ids and just keys by sequence-relative index.
+        For every (hash, local block id) pair: build a Mooncake key from the
+        hash, skip the put if Mooncake already has the key (prefix cache hit),
+        otherwise gather the strided block into staging and `put` the bytes.
+        Source: the prefill node's KV cache.
         """
+        assert len(block_hashes) == len(local_block_ids), (
+            f"block_hashes/local_block_ids length mismatch: "
+            f"{len(block_hashes)} vs {len(local_block_ids)}"
+        )
         t0 = time.perf_counter()
-        for seq_idx, bid in enumerate(block_ids):
+        n_put = 0
+        n_skip = 0
+        for bhash, bid in zip(block_hashes, local_block_ids):
+            key = self.KEY_FMT.format(h=bhash & ((1 << 64) - 1))
+            # If the key is already in the store, some earlier request with
+            # the same prefix put it there. Skip — Mooncake will serve the
+            # decode-side get() from that existing entry.
+            if self.store.is_exist(key) == 1:
+                self.blocks_skipped_push += 1
+                n_skip += 1
+                log.info("push  %s  local_bid=%d  SKIP (already in store)", key, bid)
+                continue
             # Gather the (possibly strided) block into staging — copy_() handles
             # the layout translation, then we ship the contiguous bytes.
             self.staging.copy_(self.kv_cache[:, :, bid, :, :, :])
-            key = self.KEY_FMT.format(rid=request_id, idx=seq_idx)
             # `put` copies bytes into Mooncake's mounted segment, so we can
             # reuse the staging buffer immediately for the next block.
-            # Pull raw bytes out of the storage. This works for bfloat16 / fp16
-            # which numpy doesn't natively support.
+            # ctypes.string_at handles bfloat16 / fp16 which numpy doesn't.
             payload = ctypes.string_at(self.staging.data_ptr(), self.bytes_per_block)
             t_put = time.perf_counter()
             rc = self.store.put(key, payload)
@@ -163,29 +184,34 @@ class KVTransfer:
                 raise RuntimeError(f"Mooncake put({key}) failed rc={rc}")
             self.bytes_pushed += self.bytes_per_block
             self.blocks_pushed += 1
+            n_put += 1
             log.info(
                 "push  %s  local_bid=%d  %.1f MiB  put=%.3fs",
                 key, bid, self.bytes_per_block / (1 << 20),
                 time.perf_counter() - t_put,
             )
         log.info(
-            "push  %s: %d block(s) / %.1f MiB total in %.3fs",
-            request_id, len(block_ids),
-            len(block_ids) * self.bytes_per_block / (1 << 20),
-            time.perf_counter() - t0,
+            "push  %d block(s): %d new / %d cached  in %.3fs",
+            len(block_hashes), n_put, n_skip, time.perf_counter() - t0,
         )
 
     # -------- consumer side (decode) --------
-    def pull(self, request_id: str, block_ids: List[int],
+    def pull(self, block_hashes: List[int], local_block_ids: List[int],
              *, wait_timeout: float = 30.0, poll_interval: float = 0.02) -> None:
-        """Populate the local KV cache slots at `block_ids` with bytes for `request_id`.
+        """Populate local KV slots `local_block_ids` with bytes keyed by `block_hashes`.
 
         Blocks until all expected keys are available (or `wait_timeout` is hit).
+        Order of `block_hashes` must match `local_block_ids` (hash[i] goes into
+        the local kv_cache slice at block id local_block_ids[i]).
         """
+        assert len(block_hashes) == len(local_block_ids), (
+            f"block_hashes/local_block_ids length mismatch: "
+            f"{len(block_hashes)} vs {len(local_block_ids)}"
+        )
         t0 = time.perf_counter()
         deadline = time.monotonic() + wait_timeout
-        for seq_idx, bid in enumerate(block_ids):
-            key = self.KEY_FMT.format(rid=request_id, idx=seq_idx)
+        for bhash, bid in zip(block_hashes, local_block_ids):
+            key = self.KEY_FMT.format(h=bhash & ((1 << 64) - 1))
             # Spin until the producer has published this block.
             t_wait = time.perf_counter()
             while self.store.is_exist(key) != 1:
@@ -203,8 +229,8 @@ class KVTransfer:
                     f"Mooncake get({key}) returned {len(data)} bytes, expected {expected}"
                 )
             get_s = time.perf_counter() - t_get
-            # Materialize bytes into the staging tensor, then scatter into the
-            # right block slot of the local kv_cache.
+            # Materialize bytes into a typed tensor view of the returned buffer,
+            # then scatter into the right block slot of the local kv_cache.
             tensor = torch.frombuffer(bytearray(data), dtype=self.dtype).view(*self.block_shape)
             self.kv_cache[:, :, bid, :, :, :].copy_(tensor)
             self.bytes_pulled += self.bytes_per_block
@@ -214,24 +240,11 @@ class KVTransfer:
                 key, bid, self.bytes_per_block / (1 << 20), wait_s, get_s,
             )
         log.info(
-            "pull  %s: %d block(s) / %.1f MiB total in %.3fs",
-            request_id, len(block_ids),
-            len(block_ids) * self.bytes_per_block / (1 << 20),
+            "pull  %d block(s) / %.1f MiB total in %.3fs",
+            len(block_hashes),
+            len(block_hashes) * self.bytes_per_block / (1 << 20),
             time.perf_counter() - t0,
         )
-
-    def remove(self, request_id: str, num_blocks: int) -> None:
-        """Best-effort cleanup of a request's published blocks.
-
-        Called by the producer once it knows the consumer is done.
-        """
-        for seq_idx in range(num_blocks):
-            key = self.KEY_FMT.format(rid=request_id, idx=seq_idx)
-            try:
-                self.store.remove(key)
-            except Exception:
-                # The key may already have been evicted; ignore.
-                pass
 
     def close(self) -> None:
         try:

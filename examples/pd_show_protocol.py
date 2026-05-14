@@ -163,10 +163,13 @@ def main():
             print(f"\n<<< prefill worker → orchestrator   ({dt_p:.2f}s)")
             _dump_dict("RESPONSE", prefill_resp)
 
-            print(f"\n  → prefill also pushed {prefill_resp['descriptor']['block_count']} "
-                  f"block(s) into Mooncake under keys "
-                  f"'nanovllm/req/{rid}/blk/0' ... 'nanovllm/req/{rid}/blk/"
-                  f"{prefill_resp['descriptor']['block_count']-1}'")
+            hashes = prefill_resp["descriptor"]["block_hashes"]
+            keys_preview = ", ".join(f"nanovllm/kv/{h & ((1<<64)-1):016x}" for h in hashes[:2])
+            if len(hashes) > 2:
+                keys_preview += f", ... ({len(hashes)} total)"
+            print(f"\n  → prefill also `is_exist`-probed and (where missing) pushed "
+                  f"{len(hashes)} content-addressed block(s) into Mooncake:")
+            print(f"      {keys_preview}")
 
             decode_req = {"descriptor": prefill_resp["descriptor"]}
             print(f"\n>>> orchestrator → decode worker   POST http://127.0.0.1:18102/decode")

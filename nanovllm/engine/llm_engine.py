@@ -9,6 +9,7 @@ from nanovllm.config import Config
 from nanovllm.sampling_params import SamplingParams
 from nanovllm.engine.sequence import Sequence, SequenceStatus
 from nanovllm.engine.scheduler import Scheduler
+from nanovllm.engine.block_manager import BlockManager
 from nanovllm.engine.model_runner import ModelRunner
 
 
@@ -141,11 +142,16 @@ class LLMEngine:
             self.step()
 
         block_ids = list(seq.block_table)
+        block_hashes = self._compute_block_hashes(seq)
+        assert len(block_hashes) == len(block_ids), (
+            "block hash count must match block_table length — got "
+            f"{len(block_hashes)} hashes vs {len(block_ids)} blocks"
+        )
         descriptor = {
             "request_id": request_id,
             "prompt_token_ids": list(prompt),
             "first_token": seq.last_token,
-            "block_count": len(block_ids),
+            "block_hashes": block_hashes,
             "num_prompt_tokens": seq.num_prompt_tokens,
             "num_cached_tokens": seq.num_cached_tokens,
             "temperature": sampling_params.temperature,
@@ -153,10 +159,36 @@ class LLMEngine:
             "ignore_eos": sampling_params.ignore_eos,
         }
         # Publish KV blocks before tearing down the seq so the data is still
-        # in the local cache and Mooncake can read it through put().
-        self.kv_transport.push(request_id, block_ids)
+        # in the local cache and Mooncake can read it through put(). The push
+        # itself is a no-op for any block whose hash is already in Mooncake
+        # — that's the cross-request prefix cache.
+        self.kv_transport.push(block_hashes, block_ids)
         self._evict_seq(seq)
         return descriptor
+
+    def _compute_block_hashes(self, seq: Sequence) -> list[int]:
+        """xxh64 chain hash over the prompt tokens, block by block.
+
+        Matches BlockManager.compute_hash so full blocks have the same hash
+        whether they're computed here or by the local block manager. The last
+        block may be partial (fewer than block_size tokens) — we hash whatever
+        the prompt actually fills, which is exactly what's in the KV cache at
+        push time. The trailing first-generated-token has no KV bytes yet, so
+        it's not part of any hash.
+        """
+        bs = self.config.kvcache_block_size
+        num_cached = seq.num_cached_tokens
+        h = -1
+        hashes: list[int] = []
+        for i in range(len(seq.block_table)):
+            start = i * bs
+            end = min((i + 1) * bs, num_cached)
+            if end <= start:
+                break  # no KV data for this block — shouldn't happen post-prefill
+            tokens = seq.token_ids[start:end]
+            h = BlockManager.compute_hash(tokens, h)
+            hashes.append(h)
+        return hashes
 
     def _evict_seq(self, seq: Sequence):
         """Remove a sequence from the scheduler and release its blocks."""
@@ -190,14 +222,15 @@ class LLMEngine:
         seq.status = SequenceStatus.RUNNING
         seq.is_prefill = False
 
+        block_hashes = descriptor["block_hashes"]
         # Allocate decode-local block ids — bypass the hash-based prefix cache
         # so we get fresh blocks the migrated KV bytes can land in.
         bm = self.scheduler.block_manager
-        decode_block_ids = [bm._allocate_block() for _ in range(descriptor["block_count"])]
+        decode_block_ids = [bm._allocate_block() for _ in block_hashes]
         seq.block_table = decode_block_ids
 
-        # Pull KV blocks via Mooncake
-        self.kv_transport.pull(descriptor["request_id"], decode_block_ids)
+        # Pull KV blocks via Mooncake, keyed by content hash.
+        self.kv_transport.pull(block_hashes, decode_block_ids)
 
         # Put the seq into the running queue so the scheduler picks it up.
         self.scheduler.running.append(seq)
@@ -211,8 +244,9 @@ class LLMEngine:
                     completion_tokens = tokens
                     break
 
-        # Cleanup: tell prefill's Mooncake store it can drop the keys.
-        self.kv_transport.remove(descriptor["request_id"], descriptor["block_count"])
+        # No explicit remove: keys are content-addressed and may be reused by
+        # future requests with the same prefix. Mooncake's lease/TTL handles
+        # eviction.
         text = self.tokenizer.decode(completion_tokens)
         return {
             "request_id": descriptor["request_id"],

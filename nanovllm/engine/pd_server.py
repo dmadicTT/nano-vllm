@@ -64,6 +64,7 @@ class PDWorker:
         return {"ok": True, "stats": {
             "role": self.role,
             "blocks_pushed": tx.blocks_pushed,
+            "blocks_skipped_push": tx.blocks_skipped_push,
             "blocks_pulled": tx.blocks_pulled,
             "bytes_pushed": tx.bytes_pushed,
             "bytes_pulled": tx.bytes_pulled,

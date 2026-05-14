@@ -48,7 +48,7 @@ users (the original use case of nano-vllm).
                   │     ─ store client  │                 │
                   │     ─ xfer engine   │ ◄───────────────┘
                   └─────────┬───────────┘
-                            │  (1) prefill returns {request_id, block_count,
+                            │  (1) prefill returns {request_id, block_hashes,
                             │       first_token, num_cached_tokens, sp...}
                             │
                             │  (2) prefill pushes 1 Mooncake key per paged
@@ -108,15 +108,21 @@ layout (which would slow down the colocated GPU path), we stage one block at
 a time into a contiguous scratch tensor and ship its bytes. With Qwen3-0.6B
 this is ~28 MiB / block; the gather copy is cheap relative to the RPC.
 
-One Mooncake key per paged block:
+One Mooncake key per paged block, **content-addressed**:
 
 ```
-nanovllm/req/<request_id>/blk/<seq_relative_block_idx>
+nanovllm/kv/<xxh64-of-tokens-up-to-this-block>
 ```
 
-The `seq_relative_block_idx` is **not** the local block id (those differ
-between prefill and decode because each side runs its own block manager — see
-gotcha 4 below). Instead it's the position in the request's block sequence.
+The hash is the same chain hash nano-vllm's local `BlockManager.compute_hash`
+uses (`xxh64(prev_block_hash || block_tokens)`), so two requests that share a
+prefix produce the same hashes and therefore reuse the same Mooncake keys.
+The producer-side `push` does an `is_exist` probe first and skips the put on
+a cache hit; that turns Mooncake into a **cross-request prefix cache**. Keys
+are not tied to a request id; we never call `remove` — Mooncake's lease /
+eviction reclaims them. Local block ids (which differ between prefill and
+decode because each side runs its own block manager — see gotcha 4 below) are
+only the address the bytes land into on each side, never part of the key.
 
 ### Sequence state handoff
 
@@ -127,9 +133,11 @@ After `run_prefill_and_publish`:
 * `last_token = first_token`               — but its KV is **not yet** cached
 * `status = RUNNING`
 
-The decode worker reconstructs that state, allocates fresh local blocks
-(bypassing the prefix-hash logic, see gotcha 4), `pull()`s the prompt's
-KV bytes into them, and runs its scheduler from the decode branch.
+The descriptor carries the list of `block_hashes` (one xxh64 per paged block
+of the prompt). The decode worker reconstructs the seq state, allocates fresh
+local blocks (bypassing the prefix-hash logic, see gotcha 4), and
+`pull(block_hashes, decode_local_block_ids)`s the prompt's KV bytes into
+them, then runs its scheduler from the decode branch.
 
 The first generated token's KV gets written on the decode side during its
 first decode step. So exactly the prompt is what crosses the wire.

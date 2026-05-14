@@ -229,7 +229,7 @@ def main():
             if not r.get("ok"):
                 print("PREFILL FAILED:", r); break
             desc = r["descriptor"]
-            print(f"    prefill: {t_prefill:.2f}s  blocks={desc['block_count']}  "
+            print(f"    prefill: {t_prefill:.2f}s  blocks={len(desc['block_hashes'])}  "
                   f"first_tok={desc['first_token']}")
             t0 = time.perf_counter()
             r = decode.decode(desc)
@@ -257,9 +257,11 @@ def main():
                 continue
             mb_pushed = st["bytes_pushed"] / (1 << 20)
             mb_pulled = st["bytes_pulled"] / (1 << 20)
+            skipped = st.get("blocks_skipped_push", 0)
+            skip_note = f"  skipped (cache hit): {skipped}" if skipped else ""
             print(f"  [{name}]  pushed: {st['blocks_pushed']} blocks / {mb_pushed:.1f} MiB"
                   f"   pulled: {st['blocks_pulled']} blocks / {mb_pulled:.1f} MiB"
-                  f"   ({st['bytes_per_block'] / (1<<20):.1f} MiB/block)")
+                  f"   ({st['bytes_per_block'] / (1<<20):.1f} MiB/block){skip_note}")
 
         # Scrape the master's Prometheus /metrics endpoint. Works regardless
         # of where master output is routed (verbose vs quiet mode).
