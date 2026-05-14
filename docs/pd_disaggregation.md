@@ -80,15 +80,19 @@ users (the original use case of nano-vllm).
 
 ### Wire protocol between orchestrator and worker
 
-Length-prefixed pickle over TCP. All requests are dicts with an `"action"` key:
+Plain HTTP+JSON. Each worker exposes:
 
-* **prefill** → returns a `descriptor` dict with the info the decode side needs
-  to reconstruct the sequence and pull the right keys.
-* **decode** → takes that descriptor and returns the generated text +
-  token ids.
-* **stats** → returns the worker's authoritative push/pull byte counters
+* `POST /prefill` — body `{prompt_token_ids, request_id, temperature, max_tokens, ignore_eos}` →
+  `{ok, descriptor}`. The descriptor is what the decode side needs to
+  reconstruct the sequence and pull the right Mooncake keys.
+* `POST /decode` — body `{descriptor}` → `{ok, completion_token_ids, completion_text, request_id}`.
+* `GET  /stats` — worker's authoritative push/pull byte counters
   (handy for "did anything actually transfer?" checks).
-* **shutdown** → clean exit.
+* `POST /shutdown` — clean exit.
+
+Errors come back as `{"ok": false, "error": "..."}` with HTTP 4xx/5xx.
+The control plane is one `requests`-based call per turn; the data plane
+(KV bytes) goes through Mooncake's TransferEngine and never touches HTTP.
 
 ### KV layout and key scheme
 

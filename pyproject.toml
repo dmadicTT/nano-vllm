@@ -16,6 +16,9 @@ dependencies = [
     "transformers>=4.51.0",
     "tqdm",
     "xxhash",
+    # HTTP client used by the PD worker (`PDClient`) — already pulled in by
+    # mooncake's transitive deps, but we use it directly so we declare it.
+    "requests",
     # Mooncake stack — master service binary + Python bindings ship in this wheel.
     "mooncake-transfer-engine",
     # The Mooncake wheel is built against CUDA 12 even on CPU hosts, so the

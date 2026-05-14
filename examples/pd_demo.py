@@ -115,6 +115,7 @@ def main():
         meta = subprocess.Popen(
             [meta_bin, f"--port={args.meta_port}"],
             stdout=meta_stdout, stderr=meta_stderr,
+            start_new_session=True,  # so we can killpg the whole tree on shutdown
         )
         procs.append(("meta", meta))
         _wait_for_port("127.0.0.1", args.meta_port)
@@ -133,6 +134,9 @@ def main():
                           f"--metrics_port={args.master_metrics_port}"]
         master = subprocess.Popen(
             master_cmd, stdout=master_stdout, stderr=master_stderr,
+            start_new_session=True,  # master_bin is a Python wrapper that execs
+            # the C++ binary in a child; without our own session, terminating
+            # the wrapper leaves that child reparented to init.
         )
         procs.append(("master", master))
         _wait_for_port("127.0.0.1", args.master_port)
@@ -292,26 +296,35 @@ def main():
     finally:
         for name, p in reversed(procs):
             try:
-                if hasattr(p, "terminate"):
-                    p.terminate()
-                # First wait the SIGTERM out; if the process ignores it
-                # (mooncake_master is known to be sluggish on SIGTERM),
-                # follow up with SIGKILL so we don't leak orphans onto
-                # ports 50051 / 8081 across runs.
-                if hasattr(p, "join"):
-                    p.join(timeout=5)
-                    if p.is_alive():
-                        p.kill()
-                        p.join(timeout=3)
-                elif hasattr(p, "wait"):
+                if isinstance(p, subprocess.Popen):
+                    # mooncake_master / mooncake_http_metadata_server are
+                    # Python wrappers that exec a C++ binary in a child.
+                    # We launched them with start_new_session=True so we
+                    # can kill the whole process group cleanly here.
+                    try:
+                        os.killpg(p.pid, signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
                     try:
                         p.wait(timeout=5)
                     except subprocess.TimeoutExpired:
-                        p.kill()
+                        try:
+                            os.killpg(p.pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
                         try:
                             p.wait(timeout=3)
                         except subprocess.TimeoutExpired:
                             pass
+                else:
+                    # mp.Process worker
+                    if hasattr(p, "terminate"):
+                        p.terminate()
+                    if hasattr(p, "join"):
+                        p.join(timeout=5)
+                        if p.is_alive():
+                            p.kill()
+                            p.join(timeout=3)
             except Exception:
                 pass
         print("[demo] shut down all subprocesses")

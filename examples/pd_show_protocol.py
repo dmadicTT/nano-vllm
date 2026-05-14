@@ -86,12 +86,14 @@ def main():
     try:
         meta = subprocess.Popen([meta_bin, "--port=8082"],
                                 stdout=open("/tmp/proto_meta.log", "wb"),
-                                stderr=subprocess.STDOUT)
+                                stderr=subprocess.STDOUT,
+                                start_new_session=True)
         procs.append(meta)
         _wait_for_port("127.0.0.1", 8082, timeout=10)
         master = subprocess.Popen([master_bin, "--port=50052", "--metrics_port=9023"],
                                   stdout=open("/tmp/proto_master.log", "wb"),
-                                  stderr=subprocess.STDOUT)
+                                  stderr=subprocess.STDOUT,
+                                  start_new_session=True)
         procs.append(master)
         _wait_for_port("127.0.0.1", 50052, timeout=10)
         print("[setup] mooncake_master and metadata server are up")
@@ -144,15 +146,14 @@ def main():
             rid = f"demo_req_{i+1}"
 
             prefill_req = {
-                "action": "prefill",
                 "prompt_token_ids": prompt_ids,
                 "request_id": rid,
                 "temperature": 0.7,
                 "max_tokens": 30,
                 "ignore_eos": False,
             }
-            print(f"\n>>> orchestrator → prefill worker (TCP 18101)")
-            _dump_dict("REQUEST", prefill_req)
+            print(f"\n>>> orchestrator → prefill worker  POST http://127.0.0.1:18101/prefill")
+            _dump_dict("REQUEST body", prefill_req)
             t0 = time.perf_counter()
             prefill_resp = prefill.prefill(
                 prompt_token_ids=prompt_ids, request_id=rid,
@@ -167,9 +168,9 @@ def main():
                   f"'nanovllm/req/{rid}/blk/0' ... 'nanovllm/req/{rid}/blk/"
                   f"{prefill_resp['descriptor']['block_count']-1}'")
 
-            decode_req = {"action": "decode", "descriptor": prefill_resp["descriptor"]}
-            print(f"\n>>> orchestrator → decode worker (TCP 18102)")
-            _dump_dict("REQUEST", decode_req)
+            decode_req = {"descriptor": prefill_resp["descriptor"]}
+            print(f"\n>>> orchestrator → decode worker   POST http://127.0.0.1:18102/decode")
+            _dump_dict("REQUEST body", decode_req)
             t0 = time.perf_counter()
             decode_resp = decode.decode(prefill_resp["descriptor"])
             dt_d = time.perf_counter() - t0
@@ -196,6 +197,23 @@ def main():
                     p.terminate()
                 if hasattr(p, "join"):
                     p.join(timeout=5)
+                elif isinstance(p, subprocess.Popen):
+                    import signal as _signal
+                    try:
+                        os.killpg(p.pid, _signal.SIGTERM)
+                    except ProcessLookupError:
+                        pass
+                    try:
+                        p.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        try:
+                            os.killpg(p.pid, _signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                        try:
+                            p.wait(timeout=3)
+                        except subprocess.TimeoutExpired:
+                            pass
                 else:
                     p.wait(timeout=5)
             except Exception:
