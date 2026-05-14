@@ -43,6 +43,26 @@ outputs = llm.generate(prompts, sampling_params)
 outputs[0]["text"]
 ```
 
+## PD disaggregation with Mooncake (this fork)
+
+This fork adds support for running prefill and decode in **separate workers**
+that exchange KV cache through the full Mooncake stack (master service,
+distributed store, and transfer engine, with RDMA-or-TCP transport). The
+integration is in-tree — see `nanovllm/engine/kv_transfer.py`,
+`nanovllm/engine/pd_server.py`, and the CPU paths added to
+`nanovllm/layers/attention.py` and `nanovllm/engine/model_runner.py`.
+
+End-to-end multi-turn chat demo (CPU-only):
+
+```bash
+pip install mooncake-transfer-engine nvidia-cuda-runtime-cu12
+huggingface-cli download Qwen/Qwen3-0.6B \
+    --local-dir models/Qwen3-0.6B --local-dir-use-symlinks False
+python examples/pd_demo.py
+```
+
+Design notes and gotchas: [docs/pd_disaggregation.md](docs/pd_disaggregation.md).
+
 ## Benchmark
 
 See `bench.py` for benchmark.
