@@ -9,16 +9,12 @@ class Config:
     max_num_batched_tokens: int = 16384
     max_num_seqs: int = 512
     max_model_len: int = 4096
-    gpu_memory_utilization: float = 0.9
     tensor_parallel_size: int = 1
-    enforce_eager: bool = False
     hf_config: AutoConfig | None = None
     eos: int = -1
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = -1
-    # PD disaggregation fields. device='cuda' keeps original behavior; device='cpu'
-    # enables a CPU path used by the disaggregated prefill/decode workers.
-    device: str = "cuda"
+    # PD disaggregation fields.
     role: str = "colocated"  # 'prefill' | 'decode' | 'colocated'
     # Where to reach the Mooncake stack (master + http metadata server). Only used
     # when role != 'colocated'.
@@ -32,14 +28,16 @@ class Config:
 
     def __post_init__(self):
         assert os.path.isdir(self.model)
-        # Original upstream constraint was `% 256 == 0` to match a CUDA
-        # kernel tile alignment. The CPU attention path doesn't care about
-        # the tile shape and uses block_size only as a paging granularity,
-        # so any positive value works there. The CUDA path can still pass
-        # a multiple of 256 explicitly.
+        # block_size is only a paging granularity for the CPU attention path;
+        # any positive value works.
         assert self.kvcache_block_size > 0
-        assert 1 <= self.tensor_parallel_size <= 8
-        assert self.device in ("cuda", "cpu")
+        # CPU-only build: tensor parallelism across CPU workers isn't useful
+        # (no per-shard speedup; would just duplicate the model). Keep the
+        # field for compatibility with the dist-based linear layers, but
+        # require it to stay at 1.
+        assert self.tensor_parallel_size == 1, (
+            "this CPU-only build supports tensor_parallel_size=1 only"
+        )
         assert self.role in ("prefill", "decode", "colocated")
         self.hf_config = AutoConfig.from_pretrained(self.model)
         self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)

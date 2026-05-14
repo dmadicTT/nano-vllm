@@ -1,3 +1,13 @@
+"""CPU-only model runner.
+
+Originally this file branched between a CUDA path (NCCL dist, CUDA graphs,
+flash-attn / triton kernels, GPU-memory-aware KV cache sizing) and a CPU
+path. The whole branch has been removed: nano-vllm in this fork only runs
+on CPU. The tensor-parallel scaffolding stays in place because the
+Linear / Embedding layers call `dist.get_world_size()` / `dist.get_rank()`
+— with TP=1 that's just `(1, 0)` and the all-reduce / gather paths short-
+circuit. A single `gloo` process group is enough to satisfy those.
+"""
 import pickle
 import torch
 import torch.distributed as dist
@@ -18,45 +28,27 @@ class ModelRunner:
         self.config = config
         hf_config = config.hf_config
         self.block_size = config.kvcache_block_size
-        self.enforce_eager = config.enforce_eager or config.device == "cpu"
         self.world_size = config.tensor_parallel_size
         self.rank = rank
         self.event = event
-        self.is_cpu = config.device == "cpu"
 
-        if self.is_cpu:
-            # gloo supports CPU tensors and gives the same dist.* API the linear
-            # layers expect. Single-process group on a unique port per role so
-            # prefill and decode workers don't collide.
-            port = 23330 + (hash(config.role) & 0xFF)
-            dist.init_process_group(
-                "gloo",
-                init_method=f"tcp://127.0.0.1:{port}",
-                world_size=self.world_size,
-                rank=rank,
-            )
-            default_dtype = torch.get_default_dtype()
-            torch.set_default_dtype(hf_config.torch_dtype)
-            self.model = Qwen3ForCausalLM(hf_config)
-            load_model(self.model, config.model)
-            self.sampler = Sampler()
-            self.allocate_kv_cache()
-            torch.set_default_dtype(default_dtype)
-        else:
-            dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
-            torch.cuda.set_device(rank)
-            default_dtype = torch.get_default_dtype()
-            torch.set_default_dtype(hf_config.torch_dtype)
-            torch.set_default_device("cuda")
-            self.model = Qwen3ForCausalLM(hf_config)
-            load_model(self.model, config.model)
-            self.sampler = Sampler()
-            self.warmup_model()
-            self.allocate_kv_cache()
-            if not self.enforce_eager:
-                self.capture_cudagraph()
-            torch.set_default_device("cpu")
-            torch.set_default_dtype(default_dtype)
+        # Single-process gloo group on a port unique per role so that
+        # prefill / decode / colocated workers don't collide on the
+        # rendezvous endpoint when several run on the same host.
+        port = 23330 + (hash(config.role) & 0xFF)
+        dist.init_process_group(
+            "gloo",
+            init_method=f"tcp://127.0.0.1:{port}",
+            world_size=self.world_size,
+            rank=rank,
+        )
+        default_dtype = torch.get_default_dtype()
+        torch.set_default_dtype(hf_config.torch_dtype)
+        self.model = Qwen3ForCausalLM(hf_config)
+        load_model(self.model, config.model)
+        self.sampler = Sampler()
+        self.allocate_kv_cache()
+        torch.set_default_dtype(default_dtype)
 
         if self.world_size > 1:
             if rank == 0:
@@ -73,10 +65,6 @@ class ModelRunner:
             dist.barrier()
             if self.rank == 0:
                 self.shm.unlink()
-        if not self.is_cpu and not self.enforce_eager:
-            del self.graphs, self.graph_pool
-        if not self.is_cpu:
-            torch.cuda.synchronize()
         dist.destroy_process_group()
 
     def loop(self):
@@ -109,48 +97,21 @@ class ModelRunner:
         method = getattr(self, method_name, None)
         return method(*args)
 
-    def warmup_model(self):
-        torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats()
-        max_num_batched_tokens, max_model_len = self.config.max_num_batched_tokens, self.config.max_model_len
-        seq_len = min(max_num_batched_tokens, max_model_len)
-        num_seqs = min(max_num_batched_tokens // seq_len, self.config.max_num_seqs)
-        seqs = [Sequence([0] * seq_len) for _ in range(num_seqs)]
-        for seq in seqs:
-            seq.num_scheduled_tokens = seq_len
-        self.run(seqs, True)
-        torch.cuda.empty_cache()
-
     def allocate_kv_cache(self):
         config = self.config
         hf_config = config.hf_config
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
         dtype = hf_config.torch_dtype
-        block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * dtype.itemsize
 
-        if self.is_cpu:
-            # CPU mode: we let the caller bound the cache via num_kvcache_blocks rather than
-            # auto-sizing against device memory. Default to enough blocks for a few short
-            # multi-turn conversations.
-            if config.num_kvcache_blocks <= 0:
-                config.num_kvcache_blocks = 64
-            self.kv_cache = torch.empty(
-                2, hf_config.num_hidden_layers, config.num_kvcache_blocks,
-                self.block_size, num_kv_heads, head_dim,
-                dtype=dtype, device="cpu",
-            )
-        else:
-            free, total = torch.cuda.mem_get_info()
-            used = total - free
-            peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
-            current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
-            config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
-            assert config.num_kvcache_blocks > 0
-            self.kv_cache = torch.empty(
-                2, hf_config.num_hidden_layers, config.num_kvcache_blocks,
-                self.block_size, num_kv_heads, head_dim,
-            )
+        # Caller-bounded capacity (no auto-sizing against device memory).
+        if config.num_kvcache_blocks <= 0:
+            config.num_kvcache_blocks = 64
+        self.kv_cache = torch.empty(
+            2, hf_config.num_hidden_layers, config.num_kvcache_blocks,
+            self.block_size, num_kv_heads, head_dim,
+            dtype=dtype, device="cpu",
+        )
 
         layer_id = 0
         for module in self.model.modules():
@@ -159,15 +120,8 @@ class ModelRunner:
                 module.v_cache = self.kv_cache[1, layer_id]
                 layer_id += 1
 
-    def _to_device(self, t: torch.Tensor) -> torch.Tensor:
-        if self.is_cpu:
-            return t
-        return t.cuda(non_blocking=True)
-
     def _tensor(self, data, dtype):
-        if self.is_cpu:
-            return torch.tensor(data, dtype=dtype)
-        return torch.tensor(data, dtype=dtype, pin_memory=True).cuda(non_blocking=True)
+        return torch.tensor(data, dtype=dtype)
 
     def prepare_block_tables(self, seqs: list[Sequence]):
         max_len = max(len(seq.block_table) for seq in seqs)
@@ -241,21 +195,7 @@ class ModelRunner:
 
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
-        if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
-            return self.model.compute_logits(self.model(input_ids, positions))
-        bs = input_ids.size(0)
-        context = get_context()
-        graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
-        graph_vars = self.graph_vars
-        graph_vars["input_ids"][:bs] = input_ids
-        graph_vars["positions"][:bs] = positions
-        graph_vars["slot_mapping"].fill_(-1)
-        graph_vars["slot_mapping"][:bs] = context.slot_mapping
-        graph_vars["context_lens"].zero_()
-        graph_vars["context_lens"][:bs] = context.context_lens
-        graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
-        graph.replay()
-        return self.model.compute_logits(graph_vars["outputs"][:bs])
+        return self.model.compute_logits(self.model(input_ids, positions))
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
@@ -264,40 +204,3 @@ class ModelRunner:
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
         reset_context()
         return token_ids
-
-    @torch.inference_mode()
-    def capture_cudagraph(self):
-        config = self.config
-        hf_config = config.hf_config
-        max_bs = min(self.config.max_num_seqs, 512)
-        max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
-        input_ids = torch.zeros(max_bs, dtype=torch.int64)
-        positions = torch.zeros(max_bs, dtype=torch.int64)
-        slot_mapping = torch.zeros(max_bs, dtype=torch.int32)
-        context_lens = torch.zeros(max_bs, dtype=torch.int32)
-        block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
-        outputs = torch.zeros(max_bs, hf_config.hidden_size)
-        self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
-        self.graphs = {}
-        self.graph_pool = None
-
-        for bs in reversed(self.graph_bs):
-            graph = torch.cuda.CUDAGraph()
-            set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs])
-            outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # warmup
-            with torch.cuda.graph(graph, self.graph_pool):
-                outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # capture
-            if self.graph_pool is None:
-                self.graph_pool = graph.pool()
-            self.graphs[bs] = graph
-            torch.cuda.synchronize()
-            reset_context()
-
-        self.graph_vars = dict(
-            input_ids=input_ids,
-            positions=positions,
-            slot_mapping=slot_mapping,
-            context_lens=context_lens,
-            block_tables=block_tables,
-            outputs=outputs,
-        )

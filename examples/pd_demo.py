@@ -153,9 +153,7 @@ def main():
         master_addr = f"127.0.0.1:{args.master_port}"
         meta_addr = f"http://127.0.0.1:{args.meta_port}/metadata"
         common_kwargs = dict(
-            device="cpu",
             tensor_parallel_size=1,
-            enforce_eager=True,
             max_num_seqs=4,
             max_num_batched_tokens=1024,
             max_model_len=1024,

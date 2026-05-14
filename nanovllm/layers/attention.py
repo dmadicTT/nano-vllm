@@ -1,3 +1,10 @@
+"""CPU-only paged attention.
+
+This fork removed the original CUDA path entirely. The implementation
+below uses `torch.nn.functional.scaled_dot_product_attention` for the
+math and an `index_copy_`-based paged store for KV writes — no
+flash-attn, no triton, no `triton.jit`, no `flash_attn_varlen_func`.
+"""
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -5,62 +12,14 @@ from torch import nn
 from nanovllm.utils.context import get_context
 
 
-def _lazy_import_cuda_kernels():
-    """Import flash_attn / triton lazily — they're CUDA-only.
-
-    The CPU disaggregated path never reaches these imports.
-    """
-    import triton
-    import triton.language as tl
-    from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
-
-    @triton.jit
-    def _store_kvcache_kernel(
-        key_ptr, key_stride,
-        value_ptr, value_stride,
-        k_cache_ptr, v_cache_ptr,
-        slot_mapping_ptr,
-        D: tl.constexpr,
-    ):
-        idx = tl.program_id(0)
-        slot = tl.load(slot_mapping_ptr + idx)
-        if slot == -1:
-            return
-        key_offsets = idx * key_stride + tl.arange(0, D)
-        value_offsets = idx * value_stride + tl.arange(0, D)
-        key = tl.load(key_ptr + key_offsets)
-        value = tl.load(value_ptr + value_offsets)
-        cache_offsets = slot * D + tl.arange(0, D)
-        tl.store(k_cache_ptr + cache_offsets, key)
-        tl.store(v_cache_ptr + cache_offsets, value)
-
-    def _store_kvcache_cuda(key, value, k_cache, v_cache, slot_mapping):
-        N, num_heads, head_dim = key.shape
-        D = num_heads * head_dim
-        assert key.stride(-1) == 1 and value.stride(-1) == 1
-        assert key.stride(1) == head_dim and value.stride(1) == head_dim
-        assert k_cache.stride(1) == D and v_cache.stride(1) == D
-        assert slot_mapping.numel() == N
-        _store_kvcache_kernel[(N,)](
-            key, key.stride(0), value, value.stride(0),
-            k_cache, v_cache, slot_mapping, D,
-        )
-
-    return flash_attn_varlen_func, flash_attn_with_kvcache, _store_kvcache_cuda
-
-
-# Filled in on first CUDA use to avoid importing triton/flash_attn at import time.
-_CUDA_KERNELS = None
-
-
-def _store_kvcache_cpu(
+def store_kvcache(
     key: torch.Tensor,        # [total_tokens, num_kv_heads, head_dim]
     value: torch.Tensor,
     k_cache: torch.Tensor,    # [num_blocks, block_size, num_kv_heads, head_dim]
     v_cache: torch.Tensor,
     slot_mapping: torch.Tensor,
 ):
-    """CPU implementation of paged KV-cache store. Iterates with a vector index_put_."""
+    """Paged KV-cache store via index_copy_ on a flat view."""
     N = key.shape[0]
     if N == 0:
         return
@@ -84,7 +43,7 @@ def _gqa_expand(k: torch.Tensor, n_repeat: int) -> torch.Tensor:
     return k.repeat_interleave(n_repeat, dim=-2)
 
 
-def _prefill_cpu(
+def _prefill(
     q: torch.Tensor,            # [total_tokens, num_heads, head_dim]
     k: torch.Tensor,            # [total_tokens, num_kv_heads, head_dim]
     v: torch.Tensor,
@@ -100,7 +59,6 @@ def _prefill_cpu(
     cu_q = context.cu_seqlens_q.tolist()
     cu_k = context.cu_seqlens_k.tolist()
     block_tables = context.block_tables
-    block_size = k_cache.shape[1] if k_cache.numel() else 0
     n_repeat = num_heads // num_kv_heads
     out = torch.empty_like(q)
     for i in range(len(cu_q) - 1):
@@ -141,7 +99,7 @@ def _prefill_cpu(
     return out
 
 
-def _decode_cpu(
+def _decode(
     q: torch.Tensor,            # [batch, num_heads, head_dim]
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
@@ -174,18 +132,6 @@ def _decode_cpu(
     return out
 
 
-def store_kvcache(key, value, k_cache, v_cache, slot_mapping):
-    """Dispatcher kept for backwards compatibility with the GPU path."""
-    if key.is_cpu:
-        _store_kvcache_cpu(key, value, k_cache, v_cache, slot_mapping)
-    else:
-        global _CUDA_KERNELS
-        if _CUDA_KERNELS is None:
-            _CUDA_KERNELS = _lazy_import_cuda_kernels()
-        _, _, _store_cuda = _CUDA_KERNELS
-        _store_cuda(key, value, k_cache, v_cache, slot_mapping)
-
-
 class Attention(nn.Module):
 
     def __init__(
@@ -205,37 +151,14 @@ class Attention(nn.Module):
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
         context = get_context()
         k_cache, v_cache = self.k_cache, self.v_cache
-        if q.is_cpu:
-            if k_cache.numel() and v_cache.numel() and context.slot_mapping is not None:
-                _store_kvcache_cpu(k, v, k_cache, v_cache, context.slot_mapping)
-            if context.is_prefill:
-                return _prefill_cpu(
-                    q, k, v, k_cache, v_cache, context,
-                    self.scale, self.num_heads, self.num_kv_heads, self.head_dim,
-                )
-            return _decode_cpu(
-                q, k_cache, v_cache, context,
+        if k_cache.numel() and v_cache.numel() and context.slot_mapping is not None:
+            store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
+        if context.is_prefill:
+            return _prefill(
+                q, k, v, k_cache, v_cache, context,
                 self.scale, self.num_heads, self.num_kv_heads, self.head_dim,
             )
-
-        # CUDA path — unchanged behavior.
-        global _CUDA_KERNELS
-        if _CUDA_KERNELS is None:
-            _CUDA_KERNELS = _lazy_import_cuda_kernels()
-        flash_attn_varlen_func, flash_attn_with_kvcache, _store_cuda = _CUDA_KERNELS
-        if k_cache.numel() and v_cache.numel():
-            _store_cuda(k, v, k_cache, v_cache, context.slot_mapping)
-        if context.is_prefill:
-            if context.block_tables is not None:    # prefix cache
-                k, v = k_cache, v_cache
-            return flash_attn_varlen_func(
-                q, k, v,
-                max_seqlen_q=context.max_seqlen_q, cu_seqlens_q=context.cu_seqlens_q,
-                max_seqlen_k=context.max_seqlen_k, cu_seqlens_k=context.cu_seqlens_k,
-                softmax_scale=self.scale, causal=True, block_table=context.block_tables,
-            )
-        return flash_attn_with_kvcache(
-            q.unsqueeze(1), k_cache, v_cache,
-            cache_seqlens=context.context_lens, block_table=context.block_tables,
-            softmax_scale=self.scale, causal=True,
+        return _decode(
+            q, k_cache, v_cache, context,
+            self.scale, self.num_heads, self.num_kv_heads, self.head_dim,
         )

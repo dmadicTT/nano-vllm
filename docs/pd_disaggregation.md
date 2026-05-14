@@ -16,16 +16,13 @@ transport adapter.
 
 | File | Change |
 |---|---|
-| `nanovllm/config.py` | adds `device` (`'cuda'`/`'cpu'`), `role` (`'prefill'`/`'decode'`/`'colocated'`) and a small set of `mooncake_*` fields |
-| `nanovllm/layers/attention.py` | adds a CPU attention path (`F.scaled_dot_product_attention`-based) plus a CPU KV-cache store. flash-attn + triton are now lazy-imported behind the GPU path and dropped from `pyproject.toml`; you only need them if you build with a CUDA toolkit and run `device='cuda'`. |
-| `nanovllm/engine/model_runner.py` | CPU branch that uses the `gloo` dist backend, allocates the paged KV cache on CPU and skips CUDA graphs / NCCL / `.cuda()` transfers |
-| `nanovllm/engine/llm_engine.py` | wires `KVTransfer` in when `role != 'colocated'`, adds `run_prefill_and_publish` and `run_decode_from_handoff` |
-| `nanovllm/engine/kv_transfer.py` (new) | wraps a Mooncake Store client tied to a specific paged KV cache tensor |
-| `nanovllm/engine/pd_server.py` (new) | small length-prefixed-pickle TCP server that exposes the prefill / decode methods to an orchestrator |
-| `examples/pd_demo.py` (new) | spawns master + metadata-server + two workers, drives multi-turn chat |
-
-Importantly the CUDA path is **unchanged** for `device='cuda', role='colocated'`
-users (the original use case of nano-vllm).
+| `nanovllm/config.py` | adds `role` (`'prefill'`/`'decode'`/`'colocated'`) and a small set of `mooncake_*` fields. The original `device` / `gpu_memory_utilization` / `enforce_eager` fields are gone — this fork is CPU-only. |
+| `nanovllm/layers/attention.py` | rewritten to use `F.scaled_dot_product_attention` + an `index_copy_`-based paged store. flash-attn / triton / triton.jit are removed entirely. |
+| `nanovllm/engine/model_runner.py` | the CUDA branch (NCCL, CUDA graphs, `torch.cuda.*`, pin_memory, warmup) is deleted. The runner uses a single-rank `gloo` process group so the `Linear` / `Embedding` layers' `dist.get_world_size()` calls still resolve. |
+| `nanovllm/engine/llm_engine.py` | wires `KVTransfer` in when `role != 'colocated'`, adds `run_prefill_and_publish` / `run_decode_from_handoff` / `_prefetch_from_store`. |
+| `nanovllm/engine/kv_transfer.py` (new) | wraps a Mooncake Store client tied to a specific paged KV cache tensor. |
+| `nanovllm/engine/pd_server.py` (new) | HTTP+JSON worker (`POST /prefill`, `/decode`, `GET /stats`, `POST /shutdown`). |
+| `examples/pd_*.py` (new) | demo orchestrators — see the [README](../README.md). |
 
 ---
 
@@ -322,25 +319,28 @@ which *does* accept bf16. (frombuffer of `bytes` is read-only; we wrap
 in `bytearray` so the resulting tensor is writeable for the subsequent
 `copy_` into the KV cache.)
 
-### 7. nanovllm's GPU path is intertwined enough that "just turn it off"
-takes care
+### 7. nanovllm's GPU path was intertwined enough that the cleanest fix was to delete it
 
-The CUDA path uses `torch.cuda.set_device`, `torch.set_default_device("cuda")`,
-NCCL via `dist.init_process_group("nccl", ...)`, CUDA graphs (built at
-warmup) and the flash-attn / triton kernels. The CPU branch in
-`model_runner.py`:
+Originally upstream's `ModelRunner` did `torch.cuda.set_device`,
+`torch.set_default_device("cuda")`, `dist.init_process_group("nccl", ...)`,
+captured CUDA graphs after a warmup pass, and called into flash-attn /
+triton kernels for attention. We initially kept a CPU branch alongside,
+but the GPU branch wasn't testable on this host and complicated every
+file it touched. In this fork the CUDA branch is **gone**:
 
-* uses `gloo` for the dist group (single-rank, but the Linear layers all
-  call `dist.get_world_size()`, so a real group has to exist),
-* keeps default device on CPU,
-* `enforce_eager` is forced True (no CUDA graphs),
-* skips warmup (no `torch.cuda.empty_cache()` to call),
-* `num_kvcache_blocks` is taken from the config rather than auto-sized
-  against `cudaMemGetInfo`.
+* `model_runner.py` has a single path — `gloo` process group, plain
+  `torch.empty` for the paged KV cache, no graphs, no warmup, no
+  `torch.cuda.*` anywhere.
+* `attention.py` has a single path — `F.scaled_dot_product_attention`
+  plus an `index_copy_`-based paged store. `triton` and `flash_attn`
+  are no longer imported even lazily; they're not deps.
+* `Config` has lost `device`, `gpu_memory_utilization`, and
+  `enforce_eager` — they were only ever inputs to the deleted GPU path.
 
-The attention layer's `_lazy_import_cuda_kernels` defers the
-`import flash_attn` / `import triton` to first use of the CUDA path, so the
-CPU path doesn't need either package installed.
+The CPU `Linear` / `Embedding` layers still need `dist.get_rank()` /
+`dist.get_world_size()` to resolve, so the runner still opens a single-
+rank `gloo` group on `127.0.0.1:<role-hash>`; `tensor_parallel_size` is
+asserted to `== 1`.
 
 ### 8. Periodic master metrics are emitted on a slow timer
 

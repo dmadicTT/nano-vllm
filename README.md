@@ -14,7 +14,7 @@ A lightweight vLLM implementation built from scratch.
 
 * 🚀 **Fast offline inference** — Comparable inference speeds to vLLM
 * 📖 **Readable codebase** — Clean implementation in ~ 1,200 lines of Python code
-* ⚡ **Optimization Suite** — Prefix caching, Tensor Parallelism, Torch compilation, CUDA graph
+* 🖥  **CPU-only build** — Runs Qwen3-0.6B on plain CPU through `torch.nn.functional.scaled_dot_product_attention`; no `flash-attn`, no `triton`, no CUDA. (The upstream CUDA path has been removed in this fork.)
 * 🛰  **PD disaggregation via Mooncake** — Run prefill and decode on separate workers that share KV cache through the full Mooncake stack (master + distributed store + transfer engine, RDMA-or-TCP)
 
 ## Installation
@@ -26,12 +26,11 @@ python3.10 -m venv .venv && source .venv/bin/activate
 pip install .
 ```
 
-`pip install .` pulls the runtime deps the disaggregated path actually
-uses: `torch`, `transformers`, `tqdm`, `xxhash`, `requests`,
-`mooncake-transfer-engine`, `nvidia-cuda-runtime-cu12`. It does **not**
-install `triton` or `flash-attn`; those are lazy-imported only when
-running the original CUDA / colocated path (`device='cuda'`,
-`role='colocated'`). Install them yourself if you want that.
+`pip install .` pulls the runtime deps the disaggregated CPU path needs:
+`torch`, `transformers`, `tqdm`, `xxhash`, `requests`,
+`mooncake-transfer-engine`, `nvidia-cuda-runtime-cu12`. The CUDA runtime
+is only there so the Mooncake wheel's dynamic loader can resolve
+`libcudart.so.12` — nothing in nano-vllm itself uses CUDA in this fork.
 
 ## Model
 

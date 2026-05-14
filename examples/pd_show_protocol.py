@@ -99,7 +99,7 @@ def main():
         print("[setup] mooncake_master and metadata server are up")
 
         common = dict(
-            device="cpu", tensor_parallel_size=1, enforce_eager=True,
+            tensor_parallel_size=1,
             max_num_seqs=2, max_num_batched_tokens=512, max_model_len=512,
             num_kvcache_blocks=8,
             mooncake_master_addr="127.0.0.1:50052",

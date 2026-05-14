@@ -47,7 +47,7 @@ def _worker_entry(role: str, port: int, mc_port: int, mooncake_master_port: int,
     serve(
         model=model,
         role=role, host="127.0.0.1", port=port,
-        device="cpu", tensor_parallel_size=1, enforce_eager=True,
+        tensor_parallel_size=1,
         max_num_seqs=2, max_num_batched_tokens=1024, max_model_len=1024,
         num_kvcache_blocks=8,
         mooncake_master_addr=f"127.0.0.1:{mooncake_master_port}",

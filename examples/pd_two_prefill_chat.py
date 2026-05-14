@@ -80,7 +80,7 @@ def _worker_entry(role: str, port: int, mc_port: int,
         from nanovllm.engine.pd_server import PDWorker
         worker = PDWorker(
             model=model, role=role,
-            device="cpu", tensor_parallel_size=1, enforce_eager=True,
+            tensor_parallel_size=1,
             max_num_seqs=2, max_num_batched_tokens=2048, max_model_len=2048,
             kvcache_block_size=block_size,
             num_kvcache_blocks=128,
