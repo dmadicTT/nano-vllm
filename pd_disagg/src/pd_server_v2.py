@@ -161,6 +161,12 @@ class PDServerV2:
         print(f"[PDServerV2] Block table: {seq.block_table}")
         print(f"[PDServerV2] Cached tokens: {seq.num_cached_tokens}")
         
+        # Serialize past_key_values for transfer (real model path)
+        past_kv_data = b''
+        if self.engine.model_runner.use_real_model and seq.past_key_values is not None:
+            past_kv_data = self.engine.model_runner.serialize_past_kv(seq.past_key_values)
+            print(f"[PDServerV2] Serialized past_key_values: {len(past_kv_data)} bytes")
+        
         # Store for transfer
         self.pending_transfer[request_id] = {
             "seq": seq,
@@ -178,6 +184,7 @@ class PDServerV2:
             "temperature": temperature,
             "prefill_rpc_port": self.mooncake.get_rpc_port(),
             "block_size_bytes": self.block_size_bytes,
+            "past_kv_data": past_kv_data,
         }
     
     def _receive_kv_cache_via_mooncake(
@@ -367,6 +374,9 @@ class PDServerV2:
             if abs(actual - expected) > 0.1:
                 print(f"[PDServerV2] WARNING: Block {block_id} mismatch: expected {expected}, got {actual}")
         
+        # Get past_key_values from prefill response if available
+        past_kv_data = request.get("past_kv_data", b"")
+        
         # Create sequence with received KV cache
         sampling_params = SamplingParams(
             temperature=temperature,
@@ -377,6 +387,14 @@ class PDServerV2:
         seq.block_table = list(block_table)
         seq.num_cached_tokens = num_cached_tokens
         seq.status = SequenceStatus.RUNNING  # Mark as running (decode phase)
+        
+        # Deserialize and set past_key_values for real model
+        if past_kv_data and self.engine.model_runner.use_real_model:
+            try:
+                seq.past_key_values = self.engine.model_runner.deserialize_past_kv(past_kv_data)
+                print(f"[PDServerV2] Restored past_key_values from prefill")
+            except Exception as e:
+                print(f"[PDServerV2] Warning: Failed to restore past_key_values: {e}")
         
         # Move from waiting to running in scheduler
         self.engine.scheduler.waiting.remove(seq)

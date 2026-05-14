@@ -19,11 +19,11 @@ print("=" * 60)
 print("PD Disaggregation End-to-End Test")
 print("=" * 60)
 
-model_path = "/tmp/qwen3-0.6b-full"
+model_path = "Qwen/Qwen3-0.6B"
 prefill_port = 8050
 decode_port = 8060
 
-prompt = "Hello, how are you today?"
+prompt = "The first 5 Fibonacci numbers are"
 
 print(f"\n[1/5] Starting prefill server on port {prefill_port}...")
 env = os.environ.copy()
@@ -124,6 +124,7 @@ decode_response = send_request("127.0.0.1", decode_port, {
     "temperature": prefill_response["temperature"],
     "prefill_rpc_port": prefill_response["prefill_rpc_port"],
     "block_size_bytes": prefill_response["block_size_bytes"],
+    "past_kv_data": prefill_response.get("past_kv_data", b""),
 })
 
 if "error" in decode_response:
